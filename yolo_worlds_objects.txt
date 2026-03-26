@@ -1,0 +1,98 @@
+[
+  "person","pedestrian","crowd","child","elderly person",
+  "bicycle","cycle","electric scooter","scooter","motorcycle",
+  "car","parked car","moving car","bus","school bus","truck",
+  "delivery truck","garbage truck","auto rickshaw","tractor",
+  "train","tram","metro","railway coach","boat",
+
+  "traffic light","traffic signal","pedestrian signal",
+  "stop sign","yield sign","speed limit sign","no entry sign",
+  "one way sign","u turn sign","left turn sign","right turn sign",
+  "roundabout sign","zebra crossing","pedestrian crossing sign",
+  "children crossing sign","school zone sign","hospital sign",
+  "bus stop sign","railway crossing sign","construction sign",
+  "road work sign","diversion sign","detour sign","lane closed sign",
+  "road narrows sign","uneven road sign","bump ahead sign",
+  "slippery road sign","fog warning sign","steep slope sign",
+  "dead end sign","bridge ahead sign","tunnel sign",
+
+  "signboard","road signboard","direction board","notice board",
+  "information board","warning board","digital signboard",
+  "advertisement board","billboard","LED display board",
+
+  "bench","bus stop bench","public seating","chair","plastic chair",
+  "stool","table","coffee table","side table","dining table",
+  "couch","sofa","bed","cot","mattress",
+
+  "wall","pillar","column","beam","ceiling beam","low ceiling",
+  "glass wall","glass door","glass window","transparent barrier",
+  "metal door","wooden door","rolling shutter","gate","fence",
+  "metal railing","handrail","balcony railing",
+
+  "tree","tree trunk","tree branch","low hanging branch",
+  "bush","hedge","plant","potted plant","flower pot",
+
+  "electric pole","street pole","lamp post","signal pole",
+  "fire hydrant","transformer box","electrical cabinet",
+  "junction box","control panel",
+
+  "road barrier","concrete barrier","plastic barrier",
+  "construction barrier","barricade","metal barricade",
+  "traffic cone","road cone","safety cone","divider",
+  "median divider","guard rail",
+
+  "dustbin","garbage bin","dumpster","skip bin",
+  "shopping cart","trolley","handcart","push cart",
+
+  "open manhole","manhole cover","pothole","crack in road",
+  "open drain","gutter","storm drain","water puddle",
+  "oil spill","wet floor","slippery floor","mud",
+  "loose gravel","sand pile","cement pile",
+
+  "broken glass","sharp object","metal rod","iron bar",
+  "brick","stone","rock","boulder","concrete block",
+  "pipe","PVC pipe","metal pipe","hose","cable",
+  "wire","loose wire","hanging wire","extension cord",
+
+  "ladder","step ladder","scaffold","scaffolding",
+  "staircase","stairs","steps","ramp","escalator",
+  "elevator door","lift door",
+
+  "box","cardboard box","wooden crate","plastic crate",
+  "sack","cement bag","grain bag","fertilizer bag",
+
+  "glass bottle","plastic bottle","water bottle",
+  "bucket","mug","cup","plate","utensil rack",
+
+  "mirror","wall mirror","standing mirror","display mirror",
+
+  "curtain","window blind","cloth curtain",
+  "floor mat","doormat","rug","carpet",
+
+  "shoe","footwear","slippers","sandals","boots",
+  "shoe rack","footwear rack",
+
+  "bag","backpack","school bag","handbag","duffel bag",
+  "shopping bag","plastic bag",
+
+  "fan","ceiling fan","table fan","pedestal fan",
+  "air conditioner","cooler","heater","radiator",
+
+  "TV","television","monitor","display screen",
+  "speaker","sound system","home theater",
+
+  "desk","office desk","work table","study table",
+  "office chair","wheelchair",
+
+  "helmet","safety helmet","construction helmet",
+  "fire extinguisher","fire alarm","smoke detector",
+
+  "dog","stray dog","pet dog","cat","cow","buffalo",
+  "horse","goat","sheep",
+
+  "baby stroller","pram","wheelchair ramp",
+  "crutch","walking stick","mobility aid",
+
+  "falling object","suspended object","hanging object",
+  "low clearance object","overhead obstacle"
+]
