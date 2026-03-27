@@ -18,7 +18,6 @@ app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*", async_mode="threading")
 
 def update_command(cmd):
-    """Emit the latest navigation command to all connected clients."""
     socketio.emit("command", cmd)
 
 
@@ -88,7 +87,6 @@ HTML_PAGE = """
 
     let audioUnlocked = false;
 
-    // One tap unlocks speechSynthesis for the whole session
     startBtn.addEventListener('click', () => {
       let unlock = new SpeechSynthesisUtterance('');
       speechSynthesis.speak(unlock);
@@ -189,8 +187,8 @@ print("[INFO] MiDaS loaded")
 # ===========================
 # MiDaS Background Thread
 # ===========================
-depth_map    = None
-depth_lock   = threading.Lock()
+depth_map     = None
+depth_lock    = threading.Lock()
 depth_running = False
 
 def depth_worker(small_frame):
@@ -203,10 +201,35 @@ def depth_worker(small_frame):
         d = midas(input_tensor)
     dm = d.squeeze().cpu().numpy()
     dm = (dm - dm.min()) / (dm.max() - dm.min() + 1e-6)
-    dm_resized = cv2.resize(dm, (480, 480), interpolation=cv2.INTER_LINEAR)
+    dm_resized = cv2.resize(dm, (FRAME_W, FRAME_H), interpolation=cv2.INTER_LINEAR)
     with depth_lock:
         depth_map = dm_resized
     depth_running = False
+
+
+# ===========================
+# 4x6 Grid Constants (720x480 frame)
+# ===========================
+FRAME_W = 720
+FRAME_H = 480
+COLS    = 4
+ROWS    = 6
+CW      = FRAME_W // COLS   # 180px per cell
+CH      = FRAME_H // ROWS   #  80px per cell
+
+# Danger zone: C2R5, C3R5, C2R6, C3R6 (0-indexed: cols 1-2, rows 4-5)
+DANGER_COL_START = 1
+DANGER_COL_END   = 3   # exclusive
+DANGER_ROW_START = 4
+DANGER_ROW_END   = 6   # exclusive
+
+DANGER_PX_X1 = DANGER_COL_START * CW   # 180
+DANGER_PX_X2 = DANGER_COL_END   * CW   # 540
+DANGER_PX_Y1 = DANGER_ROW_START * CH   # 320
+DANGER_PX_Y2 = DANGER_ROW_END   * CH   # 480
+
+DANGER_THRESHOLD  = 0.60
+WARNING_THRESHOLD = 0.50
 
 
 # ===========================
@@ -215,61 +238,118 @@ def depth_worker(small_frame):
 command_history  = deque(maxlen=5)
 last_command     = None
 last_yolo_result = None
+last_scaled_boxes = []          # <-- plain tuples (x1,y1,x2,y2,cls_id,conf)
 frame_counter    = 0
 
-YOLO_EVERY_N    = 2
-DEPTH_EVERY_N   = 5
-CLOSE_THRESHOLD = 0.45
-
-COMMAND_PHRASES = {
-    "go":    "Go forward",
-    "left":  "Turn left",
-    "right": "Turn right",
-    "duck":  "Duck down",
-    "stop":  "Stop. No way ahead",
-}
+YOLO_EVERY_N  = 2
+DEPTH_EVERY_N = 5
 
 
 # ===========================
-# Navigation Decision
+# Helpers
 # ===========================
-def decide_command(depth, yolo_result, frame_w=480, frame_h=480):
-    any_objects_detected = (
-        yolo_result is not None and len(yolo_result.boxes) > 0
-    )
-    if not any_objects_detected:
-        return "stop"
-
-    h, w = depth.shape
-    d_left       = np.mean(depth[:, :w//3])
-    d_right      = np.mean(depth[:, 2*w//3:])
-    center       = depth[:, w//3:2*w//3]
-    d_center_top = np.mean(center[:h//2, :])
-    d_center_bot = np.mean(center[h//2:, :])
-
-    if d_center_top > CLOSE_THRESHOLD and d_center_bot < CLOSE_THRESHOLD:
-        return "duck"
-
-    if d_center_bot < CLOSE_THRESHOLD:
-        return "go"
-
-    if d_left < CLOSE_THRESHOLD and d_right < CLOSE_THRESHOLD:
-        return "left" if d_left < d_right else "right"
-
-    if d_left < CLOSE_THRESHOLD:
-        return "left"
-
-    if d_right < CLOSE_THRESHOLD:
-        return "right"
-
-    return "stop"
+def get_cell_depth(depth, row, col):
+    """Mean depth for a single grid cell (0-indexed)."""
+    y1 = row * CH
+    y2 = y1 + CH
+    x1 = col * CW
+    x2 = x1 + CW
+    return float(np.mean(depth[y1:y2, x1:x2]))
 
 
 # ===========================
-# Main Vision Loop (runs in its own thread)
+# Grid-Based Navigation Decision
+# ===========================
+def decide_command(depth, scaled_boxes):
+    """
+    scaled_boxes: list of (x1, y1, x2, y2, cls_id, conf) in 720x480 coords.
+    Returns a navigation command string.
+    """
+
+    # --- Check if any YOLO box overlaps danger zone ---
+    object_in_danger = False
+    for (x1, y1, x2, y2, cls_id, conf) in scaled_boxes:
+        overlap_x = x1 < DANGER_PX_X2 and x2 > DANGER_PX_X1
+        overlap_y = y1 < DANGER_PX_Y2 and y2 > DANGER_PX_Y1
+        if overlap_x and overlap_y:
+            object_in_danger = True
+            break
+
+    # --- Danger zone depth (all 4 cells) ---
+    d_c2r5 = get_cell_depth(depth, 4, 1)
+    d_c3r5 = get_cell_depth(depth, 4, 2)
+    d_c2r6 = get_cell_depth(depth, 5, 1)
+    d_c3r6 = get_cell_depth(depth, 5, 2)
+    danger_depth = np.mean([d_c2r5, d_c3r5, d_c2r6, d_c3r6])
+
+    # --- Escape route depth: C1 (left) and C4 (right), bottom 2 rows ---
+    left_escape  = np.mean([get_cell_depth(depth, 4, 0),
+                             get_cell_depth(depth, 5, 0)])
+    right_escape = np.mean([get_cell_depth(depth, 4, 3),
+                             get_cell_depth(depth, 5, 3)])
+
+    # --- Overhead depth: top 2 rows, center cols ---
+    overhead_depth = np.mean([
+        get_cell_depth(depth, 0, 1), get_cell_depth(depth, 0, 2),
+        get_cell_depth(depth, 1, 1), get_cell_depth(depth, 1, 2),
+    ])
+
+    # --- Decision tree ---
+
+    # Priority 1: overhead obstacle
+    if overhead_depth > DANGER_THRESHOLD:
+        return "duck down"
+
+    # Priority 2: object in danger zone AND confirmed close by depth
+    if object_in_danger and danger_depth > DANGER_THRESHOLD:
+        if left_escape > WARNING_THRESHOLD and right_escape > WARNING_THRESHOLD:
+            return "stop"
+        if left_escape > right_escape:
+            return "turn right"
+        return "turn left"
+
+    # Priority 3: object approaching (depth warning only)
+    if danger_depth > WARNING_THRESHOLD:
+        if left_escape < right_escape:
+            return "move left"
+        return "move right"
+
+    # Priority 4: clear path
+    return "go forward"
+
+
+# ===========================
+# Draw Grid Overlay
+# ===========================
+def draw_grid(frame):
+    h, w = frame.shape[:2]
+    cw = w // COLS
+    ch = h // ROWS
+
+    for c in range(1, COLS):
+        cv2.line(frame, (c * cw, 0), (c * cw, h), (80, 80, 80), 1)
+    for r in range(1, ROWS):
+        cv2.line(frame, (0, r * ch), (w, r * ch), (80, 80, 80), 1)
+
+    # Red overlay on danger cells
+    for (row, col) in [(4, 1), (4, 2), (5, 1), (5, 2)]:
+        x1 = col * cw
+        y1 = row * ch
+        x2 = x1 + cw
+        y2 = y1 + ch
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x1, y1), (x2, y2), (0, 0, 220), -1)
+        cv2.addWeighted(overlay, 0.25, frame, 0.75, 0, frame)
+        cv2.rectangle(frame, (x1, y1), (x2, y2), (0, 0, 255), 2)
+
+    return frame
+
+
+# ===========================
+# Main Vision Loop
 # ===========================
 def vision_loop(stream):
-    global last_yolo_result, frame_counter, depth_running, last_command
+    global last_yolo_result, last_scaled_boxes, frame_counter, depth_running, last_command
 
     while True:
         frame = stream.read()
@@ -277,64 +357,81 @@ def vision_loop(stream):
             continue
 
         frame_counter += 1
-        frame_small = cv2.resize(frame, (480, 480))
-        frame_depth = cv2.resize(frame, (320, 320))
+        frame_resized = cv2.resize(frame, (FRAME_W, FRAME_H))
+        frame_depth   = cv2.resize(frame, (320, 320))
 
-        # YOLO — every N frames
+        # --- YOLO every N frames ---
         if frame_counter % YOLO_EVERY_N == 0:
-            last_yolo_result = model.predict(
-                frame_small, conf=0.3, verbose=False
-            )[0]
+            frame_yolo = cv2.resize(frame_resized, (480, 480))
+            result = model.predict(frame_yolo, conf=0.3, verbose=False)[0]
+            last_yolo_result = result
 
-        yolo_result = last_yolo_result
+            # Rescale boxes 480x480 → 720x480 into plain tuples (no xyxy write)
+            scaled_boxes = []
+            if result.boxes is not None and len(result.boxes):
+                for box in result.boxes:
+                    x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+                    x1 = x1 * FRAME_W / 480
+                    x2 = x2 * FRAME_W / 480
+                    y1 = y1 * FRAME_H / 480
+                    y2 = y2 * FRAME_H / 480
+                    cls_id = int(box.cls[0])
+                    conf   = float(box.conf[0])
+                    scaled_boxes.append((x1, y1, x2, y2, cls_id, conf))
+            last_scaled_boxes = scaled_boxes
 
-        # MiDaS — every N frames, non-blocking
+        # --- MiDaS every N frames, non-blocking ---
         if frame_counter % DEPTH_EVERY_N == 0 and not depth_running:
             depth_running = True
-            Thread(
-                target=depth_worker, args=(frame_depth,), daemon=True
-            ).start()
+            Thread(target=depth_worker, args=(frame_depth,), daemon=True).start()
 
-        # Annotate
-        if yolo_result is not None:
-            annotated = yolo_result.plot()
-        else:
-            annotated = frame_small.copy()
+        # --- Draw YOLO boxes ---
+        annotated = frame_resized.copy()
+        for (x1, y1, x2, y2, cls_id, conf) in last_scaled_boxes:
+            ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+            label = model.names[cls_id] if cls_id < len(model.names) else ""
+            cv2.rectangle(annotated, (ix1, iy1), (ix2, iy2), (0, 255, 0), 2)
+            cv2.putText(annotated, f"{label} {conf:.2f}",
+                        (ix1, max(iy1 - 6, 12)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
 
-        # Navigation
+        # --- Draw 4x6 grid ---
+        annotated = draw_grid(annotated)
+
+        # --- Navigation ---
         with depth_lock:
             current_depth = depth_map
 
         if current_depth is None:
+            cv2.putText(annotated, "Waiting for depth...", (10, 35),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
             cv2.imshow("YOLO + MiDaS Navigation", annotated)
             if cv2.waitKey(1) & 0xFF == ord("q"):
                 break
             continue
 
-        command = decide_command(current_depth, yolo_result)
+        command = decide_command(current_depth, last_scaled_boxes)
         command_history.append(command)
         stable_command = max(set(command_history), key=command_history.count)
 
-        # Emit on change
         if stable_command != last_command:
             print(f"[NAV] {stable_command.upper()}")
-            update_command(stable_command)          # → SocketIO
+            update_command(stable_command)
             last_command = stable_command
 
-        # Draw YOLO boxes + command
-        if yolo_result is not None and len(yolo_result.boxes):
-            for box in yolo_result.boxes:
-                x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
-                cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        # --- HUD ---
+        cv2.putText(annotated, f"CMD: {stable_command.upper()}",
+                    (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 0, 255), 2)
 
-        cv2.putText(annotated, f"CMD: {stable_command.upper()}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
-
-        # Live depth zone scores for tuning
-        h2, w2 = current_depth.shape
-        d_l = np.mean(current_depth[:, :w2//3])
-        d_r = np.mean(current_depth[:, 2*w2//3:])
-        d_c = np.mean(current_depth[h2//2:, w2//3:2*w2//3])
-        cv2.putText(annotated, f"L:{d_l:.2f} C:{d_c:.2f} R:{d_r:.2f}", (10, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
+        d_c2r5 = get_cell_depth(current_depth, 4, 1)
+        d_c3r5 = get_cell_depth(current_depth, 4, 2)
+        d_c2r6 = get_cell_depth(current_depth, 5, 1)
+        d_c3r6 = get_cell_depth(current_depth, 5, 2)
+        cv2.putText(annotated,
+                    f"DZ: C2R5={d_c2r5:.2f} C3R5={d_c3r5:.2f} "
+                    f"C2R6={d_c2r6:.2f} C3R6={d_c3r6:.2f}",
+                    (10, FRAME_H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 0), 1)
 
         cv2.imshow("YOLO + MiDaS Navigation", annotated)
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -356,7 +453,6 @@ if __name__ == "__main__":
 
     stream = WebcamStream(ip_address)
 
-    # Vision runs in a background thread so Flask can own the main thread
     vision_thread = Thread(target=vision_loop, args=(stream,), daemon=True)
     vision_thread.start()
 
