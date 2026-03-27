@@ -226,7 +226,6 @@ COMMAND_PHRASES = {
     "left":  "Turn left",
     "right": "Turn right",
     "duck":  "Duck down",
-    "uturn": "Make a U-turn",
     "stop":  "Stop. No way ahead",
 }
 
@@ -263,7 +262,7 @@ def decide_command(depth, yolo_result, frame_w=480, frame_h=480):
     if d_right < CLOSE_THRESHOLD:
         return "right"
 
-    return "uturn"
+    return "stop"
 
 
 # ===========================
