@@ -44,7 +44,23 @@ HTML_PAGE = """
       font-weight: bold;
       color: #00ff99;
       letter-spacing: 0.1em;
-      transition: color 0.2s;
+    }
+    #start-btn {
+      font-size: 1.5rem;
+      padding: 1rem 2.5rem;
+      background: #00ff99;
+      color: #0d0d0d;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+      font-family: monospace;
+      font-weight: bold;
+      margin-top: 2rem;
+    }
+    #start-btn:disabled {
+      background: #1a1a1a;
+      color: #444;
+      cursor: default;
     }
     #dot {
       width: 14px;
@@ -59,14 +75,27 @@ HTML_PAGE = """
 </head>
 <body>
   <div id="cmd">WAITING...</div>
+  <button id="start-btn">TAP TO ENABLE AUDIO</button>
   <div id="dot"></div>
   <div id="status">connecting...</div>
 
   <script>
-    const socket = io();
-    const cmdEl   = document.getElementById('cmd');
-    const dotEl   = document.getElementById('dot');
-    const statEl  = document.getElementById('status');
+    const socket   = io();
+    const cmdEl    = document.getElementById('cmd');
+    const dotEl    = document.getElementById('dot');
+    const statEl   = document.getElementById('status');
+    const startBtn = document.getElementById('start-btn');
+
+    let audioUnlocked = false;
+
+    // One tap unlocks speechSynthesis for the whole session
+    startBtn.addEventListener('click', () => {
+      let unlock = new SpeechSynthesisUtterance('');
+      speechSynthesis.speak(unlock);
+      audioUnlocked = true;
+      startBtn.textContent = 'AUDIO ENABLED';
+      startBtn.disabled = true;
+    });
 
     socket.on('connect', () => {
       dotEl.classList.add('connected');
@@ -81,6 +110,10 @@ HTML_PAGE = """
     socket.on('command', (cmd) => {
       console.log('NAV CMD:', cmd);
       cmdEl.textContent = cmd.toUpperCase();
+      if (audioUnlocked) {
+        speechSynthesis.cancel();
+        speechSynthesis.speak(new SpeechSynthesisUtterance(cmd));
+      }
     });
   </script>
 </body>
@@ -186,7 +219,7 @@ frame_counter    = 0
 
 YOLO_EVERY_N    = 2
 DEPTH_EVERY_N   = 5
-CLOSE_THRESHOLD = 0.65
+CLOSE_THRESHOLD = 0.45
 
 COMMAND_PHRASES = {
     "go":    "Go forward",
@@ -295,15 +328,14 @@ def vision_loop(stream):
                 x1, y1, x2, y2 = [int(v) for v in box.xyxy[0].tolist()]
                 cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 255, 0), 2)
 
-        cv2.putText(
-            annotated,
-            f"CMD: {stable_command.upper()}",
-            (10, 35),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1,
-            (0, 0, 255),
-            2,
-        )
+        cv2.putText(annotated, f"CMD: {stable_command.upper()}", (10, 35), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 0, 255), 2)
+
+        # Live depth zone scores for tuning
+        h2, w2 = current_depth.shape
+        d_l = np.mean(current_depth[:, :w2//3])
+        d_r = np.mean(current_depth[:, 2*w2//3:])
+        d_c = np.mean(current_depth[h2//2:, w2//3:2*w2//3])
+        cv2.putText(annotated, f"L:{d_l:.2f} C:{d_c:.2f} R:{d_r:.2f}", (10, 465), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 0), 1)
 
         cv2.imshow("YOLO + MiDaS Navigation", annotated)
         if cv2.waitKey(1) & 0xFF == ord("q"):
