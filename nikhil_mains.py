@@ -6,6 +6,8 @@ import numpy as np
 from collections import deque
 import threading
 import time
+import os
+from pathlib import Path
 
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO
@@ -214,9 +216,11 @@ cv2.ocl.setUseOpenCL(True)
 # ===========================
 # Load YOLO-World
 # ===========================
-model = YOLOWorld("yolov8s-world.pt")
+# Point to the existing weights in spatial_guidance — avoids re-downloading
+_SPATIAL = Path(r"C:\Users\avikv\.vscode\spatial_guidance")
+model = YOLOWorld(str(_SPATIAL / "yolov8s-world.pt"))
 
-with open("yolo_worlds_objects.txt", "r") as f:
+with open(str(_SPATIAL / "yolo_worlds_objects.txt"), "r") as f:
     VOCAB = eval(f.read())
 
 model.set_classes(VOCAB)
@@ -542,19 +546,170 @@ def vision_loop(stream):
 
 
 # ===========================
+# Image-Batch Processing Mode
+# ===========================
+def process_images(image_paths, output_dir, progress_callback=None):
+    """
+    Run YOLO + MiDaS on a list of image file paths.
+    Saves annotated images (bounding boxes + relative depth per object) to output_dir.
+
+    Args:
+        image_paths      : list of str — absolute paths to input images
+        output_dir       : str — folder where annotated images are saved
+        progress_callback: callable(done, total) or None — called after each image
+
+    Returns:
+        list of str — paths to all saved output images
+    """
+    os.makedirs(output_dir, exist_ok=True)
+    saved = []
+    total = len(image_paths)
+
+    for idx, img_path in enumerate(image_paths, start=1):
+        frame = cv2.imread(img_path)
+        if frame is None:
+            print(f"[WARN] Could not read: {img_path} — skipping")
+            if progress_callback:
+                progress_callback(idx, total)
+            continue
+
+        # --- Resize to working resolution ---
+        frame_resized = cv2.resize(frame, (FRAME_W, FRAME_H))
+
+        # --- YOLO detection ---
+        frame_yolo = cv2.resize(frame_resized, (480, 480))
+        result = model.predict(frame_yolo, conf=0.3, verbose=False)[0]
+        detected_boxes = []
+        if result.boxes is not None and len(result.boxes):
+            for box in result.boxes:
+                x1, y1, x2, y2 = [float(v) for v in box.xyxy[0].tolist()]
+                detected_boxes.append((
+                    x1 * FRAME_W / 480, y1 * FRAME_H / 480,
+                    x2 * FRAME_W / 480, y2 * FRAME_H / 480,
+                    int(box.cls[0]), float(box.conf[0])
+                ))
+
+        # --- MiDaS depth (synchronous for image mode) ---
+        frame_depth = cv2.resize(frame, (320, 320))
+        img_rgb = cv2.cvtColor(frame_depth, cv2.COLOR_BGR2RGB)
+        input_tensor = midas_transform(img_rgb).to(device)
+        if input_tensor.ndim == 3:
+            input_tensor = input_tensor.unsqueeze(0)
+        with torch.no_grad():
+            d = midas(input_tensor)
+        dm = d.squeeze().cpu().numpy()
+        dm = (dm - dm.min()) / (dm.max() - dm.min() + 1e-6)
+        current_depth = cv2.resize(dm, (FRAME_W, FRAME_H), interpolation=cv2.INTER_LINEAR)
+
+        # --- Build annotated output ---
+        annotated = frame_resized.copy()
+
+        # Subtle depth heatmap blended into background (20% opacity)
+        depth_vis  = (current_depth * 255).astype(np.uint8)
+        depth_heat = cv2.applyColorMap(depth_vis, cv2.COLORMAP_MAGMA)
+        cv2.addWeighted(depth_heat, 0.20, annotated, 0.80, 0, annotated)
+
+        # Grid overlay
+        grid      = compute_grid(current_depth)
+        annotated = draw_grid(annotated, grid)
+
+        # YOLO boxes + per-object relative depth label
+        for (x1, y1, x2, y2, cls_id, conf) in detected_boxes:
+            ix1, iy1, ix2, iy2 = int(x1), int(y1), int(x2), int(y2)
+
+            # Average depth inside bounding box
+            bx1 = max(0, ix1); bx2 = min(FRAME_W, ix2)
+            by1 = max(0, iy1); by2 = min(FRAME_H, iy2)
+            box_depth_mean = float(np.mean(current_depth[by1:by2, bx1:bx2])) \
+                             if (bx2 > bx1 and by2 > by1) else 0.0
+
+            # Colour by proximity: red=very close … green=far
+            if   box_depth_mean >= CRITICAL_THRESHOLD: box_color = (0,   0, 255)
+            elif box_depth_mean >= DANGER_THRESHOLD:   box_color = (0,  80, 255)
+            elif box_depth_mean >= WARNING_THRESHOLD:  box_color = (0, 200, 255)
+            else:                                      box_color = (0, 220,   0)
+
+            label_name = model.names[cls_id] if cls_id < len(model.names) else str(cls_id)
+            label_text = f"{label_name} {conf:.2f}  rel:{box_depth_mean:.2f}"
+
+            cv2.rectangle(annotated, (ix1, iy1), (ix2, iy2), box_color, 2)
+
+            # Solid pill behind text for readability
+            (tw, th), _ = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, 0.42, 1)
+            ty = max(iy1 - 6, th + 4)
+            cv2.rectangle(annotated, (ix1, ty - th - 4), (ix1 + tw + 4, ty + 2),
+                          box_color, -1)
+            cv2.putText(annotated, label_text, (ix1 + 2, ty),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 0, 0), 1, cv2.LINE_AA)
+
+        # Navigation decision HUD
+        raw_cmd = decide_command(current_depth, detected_boxes)
+        phrase   = COMMAND_PHRASES.get(raw_cmd, raw_cmd)
+        cv2.putText(annotated, f"CMD: {phrase}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
+
+        dz = float(np.mean([grid[4, 1], grid[4, 2], grid[5, 1], grid[5, 2]]))
+        cv2.putText(annotated,
+                    f"DZ:{dz:.2f}  L-esc:{grid[4,0]:.2f}  R-esc:{grid[4,3]:.2f}",
+                    (10, FRAME_H - 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.42, (255, 255, 0), 1, cv2.LINE_AA)
+
+        cv2.putText(annotated, f"{idx}/{total}",
+                    (FRAME_W - 80, 22), cv2.FONT_HERSHEY_SIMPLEX, 0.55, (200, 200, 200), 1)
+
+        # Save annotated image
+        stem     = Path(img_path).stem
+        out_name = f"calib_{idx:04d}_{stem}.jpg"
+        out_path = os.path.join(output_dir, out_name)
+        cv2.imwrite(out_path, annotated, [cv2.IMWRITE_JPEG_QUALITY, 92])
+        saved.append(out_path)
+        print(f"[IMG {idx:>3}/{total}] {stem} → {out_name}  cmd={raw_cmd}")
+
+        if progress_callback:
+            progress_callback(idx, total)
+
+    print(f"\n[DONE] {len(saved)}/{total} images saved to: {output_dir}")
+    return saved
+
+
+# ===========================
 # Entry Point
 # ===========================
 if __name__ == "__main__":
-    ip_address = input(
-        "Enter IP address of IP webcamera or type 0 if using laptop cam: "
-    )
-    if ip_address == "0":
-        ip_address = 0
+    import sys
 
-    stream = WebcamStream(ip_address)
+    # Image-batch mode: python nikhil_mains.py --images <folder> [--output <folder>]
+    if "--images" in sys.argv:
+        img_idx    = sys.argv.index("--images") + 1
+        img_folder = sys.argv[img_idx]
+        out_folder = "./calibration_images"
+        if "--output" in sys.argv:
+            out_folder = sys.argv[sys.argv.index("--output") + 1]
 
-    vision_thread = Thread(target=vision_loop, args=(stream,), daemon=True)
-    vision_thread.start()
+        exts  = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+        paths = sorted(
+            str(p) for p in Path(img_folder).iterdir()
+            if p.suffix.lower() in exts
+        )
+        if not paths:
+            print(f"[ERROR] No images found in: {img_folder}")
+            sys.exit(1)
 
-    print("[INFO] Dashboard → http://localhost:5000")
-    socketio.run(app, host="0.0.0.0", port=5000, use_reloader=False)
+        print(f"[INFO] Image-batch mode: {len(paths)} images → {out_folder}")
+        process_images(paths, out_folder)
+
+    else:
+        # Live-camera mode (original behaviour)
+        ip_address = input(
+            "Enter IP address of IP webcamera or type 0 if using laptop cam: "
+        )
+        if ip_address == "0":
+            ip_address = 0
+
+        stream = WebcamStream(ip_address)
+
+        vision_thread = Thread(target=vision_loop, args=(stream,), daemon=True)
+        vision_thread.start()
+
+        print("[INFO] Dashboard → http://localhost:5000")
+        socketio.run(app, host="0.0.0.0", port=5000, use_reloader=False)

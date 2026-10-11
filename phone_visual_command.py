@@ -1,11 +1,13 @@
 from ultralytics import YOLOWorld
 import cv2
 from threading import Thread
-import torch
 import numpy as np
 from collections import deque
 import threading
 import time
+import os
+from pathlib import Path
+import openvino as ov
 
 from flask import Flask, render_template_string
 from flask_socketio import SocketIO
@@ -214,25 +216,46 @@ cv2.ocl.setUseOpenCL(True)
 # ===========================
 # Load YOLO-World
 # ===========================
-model = YOLOWorld("yolov8s-world.pt")
+_BASE_DIR = Path(__file__).parent.resolve()
+_YOLO_WEIGHTS = str(_BASE_DIR / "yolov8s-world.pt")
+_VOCAB_FILE = str(_BASE_DIR / "yolo_worlds_objects.txt")
 
-with open(r"C:\Users\avikv\.vscode\yolo_worlds_objects.txt", "r") as f:
+model = YOLOWorld(_YOLO_WEIGHTS)
+
+with open(_VOCAB_FILE, "r") as f:
     VOCAB = eval(f.read())
 
 model.set_classes(VOCAB)
 
 
 # ===========================
-# Load MiDaS
+# Load MiDaS INT8 (OpenVINO)
 # ===========================
-device = torch.device("cpu")
+_MIDAS_INT8_PATH = str(_BASE_DIR / "optimized_models" / "midas_small_int8.xml")
+_MIDAS_INPUT_SIZE = 256                      # native size used during quantization
 
-print("[INFO] Loading MiDaS...")
-midas = torch.hub.load("intel-isl/MiDaS", "MiDaS_small")
-midas.to(device)
-midas.eval()
-midas_transform = torch.hub.load("intel-isl/MiDaS", "transforms").small_transform
-print("[INFO] MiDaS loaded")
+# Preprocessing constants — MUST stay identical to 1_convert_midas_int8.py
+_MIDAS_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+_MIDAS_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+
+print("[INFO] Loading MiDaS INT8 (OpenVINO)...")
+_ov_core          = ov.Core()
+_midas_model      = _ov_core.read_model(_MIDAS_INT8_PATH)
+_midas_compiled   = _ov_core.compile_model(_midas_model, "CPU",
+                                           {"PERFORMANCE_HINT": "LATENCY"})
+_midas_output     = _midas_compiled.output(0)
+print("[INFO] MiDaS INT8 loaded")
+
+
+def _midas_preprocess(frame_bgr):
+    """BGR uint8 -> float32 tensor (1, 3, 256, 256). Identical to conversion script."""
+    img = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
+    img = cv2.resize(img, (_MIDAS_INPUT_SIZE, _MIDAS_INPUT_SIZE),
+                     interpolation=cv2.INTER_CUBIC)
+    img = img.astype(np.float32) / 255.0
+    img = (img - _MIDAS_MEAN) / _MIDAS_STD
+    img = img.transpose(2, 0, 1)[None]          # (1, 3, 256, 256)
+    return np.ascontiguousarray(img, dtype=np.float32)
 
 
 # ===========================
@@ -243,21 +266,18 @@ depth_lock    = threading.Lock()
 depth_running = False
 
 def depth_worker(small_frame):
+    """Run INT8 MiDaS on small_frame and update global depth_map."""
     global depth_map, depth_running
     try:
-        img_rgb = cv2.cvtColor(small_frame, cv2.COLOR_BGR2RGB)
-        input_tensor = midas_transform(img_rgb).to(device)
-        if input_tensor.ndim == 3:
-            input_tensor = input_tensor.unsqueeze(0)
-        with torch.no_grad():
-            d = midas(input_tensor)
-        dm = d.squeeze().cpu().numpy()
+        x  = _midas_preprocess(small_frame)
+        dm = _midas_compiled(x)[_midas_output].squeeze()   # (256, 256) float32
         dm = (dm - dm.min()) / (dm.max() - dm.min() + 1e-6)
         dm_resized = cv2.resize(dm, (FRAME_W, FRAME_H), interpolation=cv2.INTER_LINEAR)
         with depth_lock:
             depth_map = dm_resized
     finally:
         depth_running = False
+
 
 
 # ===========================

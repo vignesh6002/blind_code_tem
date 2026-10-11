@@ -1,0 +1,5 @@
+.venv/
+.vscode/
+__pycache__/
+*.pyc
+optimized_models/*fp32*
